@@ -1,0 +1,80 @@
+"""Exports an audit result as a standalone HTML report (can be printed to PDF)."""
+from __future__ import annotations
+
+import html
+
+from .audit import PILLARS
+
+
+def _color(score: float) -> str:
+    return "#1a7f37" if score >= 80 else "#b7791f" if score >= 60 else "#c53030"
+
+
+def _table(df, fmt="{:.3f}") -> str:
+    head = "".join(f"<th>{html.escape(str(c))}</th>" for c in [df.index.name or ""] + list(df.columns))
+    rows = ""
+    for idx, r in df.iterrows():
+        cells = "".join(
+            f"<td>{fmt.format(v) if isinstance(v, float) else html.escape(str(v))}</td>" for v in r
+        )
+        rows += f"<tr><td><b>{html.escape(str(idx))}</b></td>{cells}</tr>"
+    return f"<table><tr>{head}</tr>{rows}</table>"
+
+
+def build_html_report(r: dict) -> str:
+    pillars = ""
+    for p, (w, eu, nist) in PILLARS.items():
+        s = r["scores"][p]
+        pillars += (
+            f"<tr><td><b>{p}</b></td><td>{w:.0%}</td>"
+            f"<td><div class='bar'><div style='width:{s}%;background:{_color(s)}'></div></div></td>"
+            f"<td style='color:{_color(s)}'><b>{s:.0f}</b></td><td>{eu}</td><td>{nist}</td></tr>"
+        )
+    findings = "".join(
+        f"<tr><td>{f['attribute']}</td><td>{f['metric']}</td><td>{f['value']}</td>"
+        f"<td>{'&ge;' if f['key']=='disparate_impact_ratio' else '&le;'} {f['threshold']}</td>"
+        f"<td class='{f['status'].lower()}'>{f['status']}</td></tr>"
+        for f in r["fairness_findings"]
+    )
+    flips = "".join(
+        f"<li><b>{a}</b>: changing only this attribute changes {v['flip_rate']:.1%} of decisions "
+        f"({'used directly by model' if v['in_model'] else 'not a model input'})</li>"
+        for a, v in r["flip_tests"].items() if v.get("tested")
+    )
+    groups = "".join(
+        f"<h3>Groups by {a}</h3>" + _table(t[["count", "selection_rate", "base_rate", "accuracy", "tpr", "fpr", "precision"]])
+        for a, t in r["group_tables"].items()
+    )
+    imp = "".join(
+        f"<tr><td>{row.feature}</td><td><div class='bar'><div style='width:{max(0, row.importance) / max(1e-9, r['importance'].importance.max()) * 100:.0f}%;background:#3b5bdb'></div></div></td>"
+        f"<td>{row.importance:.4f}</td></tr>"
+        for row in r["importance"].itertuples()
+    )
+    rob = "".join(f"<tr><td>{x.noise_level:.0%}</td><td>{x.flip_rate:.2%}</td></tr>" for x in r["robustness"].itertuples())
+    recs = "".join(f"<li>{html.escape(x)}</li>" for x in r["recommendations"])
+    perf = r["performance"]
+    notes = ", ".join(r["notes"]) or "baseline model"
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>AI Decision Audit Report</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;max-width:960px;margin:30px auto;color:#222;padding:0 16px}}
+h1{{margin-bottom:0}} .sub{{color:#666}} table{{border-collapse:collapse;width:100%;margin:10px 0}}
+td,th{{border:1px solid #ddd;padding:6px 8px;font-size:14px;text-align:left}} th{{background:#f3f4f6}}
+.verdict{{padding:16px;border-radius:8px;color:#fff;font-size:20px;background:{_color(r['overall'] if not r['critical'] else min(r['overall'], 79))}}}
+.bar{{background:#eee;height:12px;border-radius:6px;width:180px}} .bar div{{height:12px;border-radius:6px}}
+.pass{{color:#1a7f37;font-weight:bold}} .fail{{color:#c53030;font-weight:bold}}
+</style></head><body>
+<h1>AI Decision Audit Report</h1>
+<p class='sub'>Model: <b>{r['model_name']}</b> ({notes}) &middot; fingerprint <code>{r['model_id']}</code> &middot; {r['timestamp']} &middot; {r['n_test']} test decisions audited</p>
+<div class='verdict'>Overall trust score: <b>{r['overall']:.0f}/100</b> &mdash; {r['verdict']}</div>
+<h2>1. Trust scorecard</h2><table><tr><th>Pillar</th><th>Weight</th><th></th><th>Score</th><th>EU AI Act</th><th>NIST AI RMF</th></tr>{pillars}</table>
+<h2>2. Recommendations</h2><ol>{recs}</ol>
+<h2>3. Fairness</h2><table><tr><th>Attribute</th><th>Metric</th><th>Value</th><th>Required</th><th>Result</th></tr>{findings}</table>
+<p><b>Counterfactual (flip) test:</b></p><ul>{flips}</ul>{groups}
+<h2>4. Transparency</h2><p>Global feature importance (drop in ROC-AUC when the feature is shuffled). Explanation fidelity error: {r['fidelity_error']:.4f}.</p>
+<table><tr><th>Feature</th><th></th><th>Importance</th></tr>{imp}</table>
+<h2>5. Robustness</h2><table><tr><th>Noise added (x std-dev)</th><th>Decisions that changed</th></tr>{rob}</table>
+<p>{len(r['boundary_cases'])} borderline decisions (within 5% of the threshold) should go to human review.</p>
+<h2>6. Performance</h2><p>Accuracy {perf['accuracy']:.1%} &middot; F1 {perf['f1']:.3f} &middot; ROC-AUC {perf['roc_auc']:.3f} &middot; approval rate {perf['approval_rate']:.1%}</p>
+<h2>7. Accountability</h2><p>Audit-log integrity: <b>{'VALID' if r['ledger_status']['valid'] else 'TAMPERED'}</b> ({r['ledger_status']['reason']}); {r['n_logged']} decisions logged in the hash-chained audit trail.</p>
+<hr><p class='sub'>Generated by AI Decision Auditor &mdash; Trustworthy AI course project.</p>
+</body></html>"""
